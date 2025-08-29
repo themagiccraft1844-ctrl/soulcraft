@@ -1,0 +1,20 @@
+{
+  "resource_pack_name": "soulcraft",
+  "texture_name": "atlas.terrain",
+  "padding": 8,
+  "num_mip_levels": 4,
+  "texture_data": {
+    "empty_soul_sand": {
+      "textures": "textures/blocks/empty_soul_sand"
+    },
+    "quarter_soul_sand": {
+      "textures": "textures/blocks/quarter_soul_sand"
+    },
+    "half_soul_sand": {
+      "textures": "textures/blocks/half_soul_sand"
+    },
+    "almost_full_soul_sand": {
+      "textures": "textures/blocks/almost_full_soul_sand"
+    }
+  }
+}

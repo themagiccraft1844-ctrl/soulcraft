@@ -1,0 +1,36 @@
+//bridge-file-version: #9
+{
+	"format_version": 2,
+	"header": {
+		"description": "TRIAL",
+		"name": "SoulCraft",
+		"uuid": "1401933c-dda7-11e9-8a34-2a2ae2dbcce4",
+		"version": [
+			0,
+			0,
+			1
+		],
+		"min_engine_version": [
+			1,
+			13,
+			0
+		]
+	},
+	"modules": [
+		{
+			"description": "TRIAL",
+			"type": "resources",
+			"uuid": "1401962a-dda7-11e9-8a34-2a2ae2dbcce4",
+			"version": [
+				0,
+				0,
+				1
+			]
+		}
+	],
+	"metadata": {
+		"authors": [
+			"Gavin"
+		]
+	}
+}

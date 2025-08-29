@@ -1,0 +1,73 @@
+{
+  "format_version": "1.21.90",
+  "minecraft:entity": {
+    "description": {
+      "identifier": "soulcraft:temp_sensor",
+      "is_spawnable": true,
+      "is_summonable": true
+    },
+    "components": {
+      "minecraft:health": { "value": 1, "max": 1 },
+      "minecraft:breathable": {
+        "total_supply": 99999,
+        "suffocate_time": 99999,
+        "breathes_solids": true,
+        "breathes_air": true,
+        "breathes_water": true
+      },
+      "minecraft:collision_box": { "width": 0, "height": 0 }
+    },
+    "events": {
+      "minecraft:entity_spawned": {
+        "sequence": [
+          {
+            "first_valid": [
+              {
+                "filters": {
+                  "test": "has_biome_tag",
+                  "value": "spawns_warm_variant_farm_animals"
+                },
+                "add": {
+                  "component_groups": ["soulcraft:variant_warm"]
+                }
+              },
+              {
+                "filters": {
+                  "test": "has_biome_tag",
+                  "value": "spawns_cold_variant_farm_animals"
+                },
+                "add": {
+                  "component_groups": ["soulcraft:variant_cold"]
+                }
+              },
+              {
+                "add": {
+                  "component_groups": ["soulcraft:variant_temperate"]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "soulcraft:trigger_despawn": {
+        "add": {
+          "component_groups": ["soulcraft:despawn_component"]
+        }
+      }
+    },
+    "component_groups": {
+      "soulcraft:variant_warm": {
+        "minecraft:variant": { "value": 0 }
+      },
+      "soulcraft:variant_cold": {
+        "minecraft:variant": { "value": 1 }
+      },
+      "soulcraft:variant_temperate": {
+        "minecraft:variant": { "value": 2 }
+      },
+      "soulcraft:despawn_component": {
+        "minecraft:instant_despawn": {}
+      }
+    }
+  }
+}

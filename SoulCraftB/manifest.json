@@ -1,0 +1,55 @@
+{
+	"format_version": 2,
+	"header": {
+		"description": "TRIAL",
+		"name": "SoulCraft",
+		"uuid": "fd942f74-dda6-11e9-9d36-2a2ae2dbcce4",
+		"version": [
+			0,
+			0,
+			1
+		],
+		"min_engine_version": [
+			1,
+			20,
+			0
+		]
+	},
+	"modules": [
+		{
+			"description": "TRIAL",
+			"type": "data",
+			"uuid": "fd943276-dda6-11e9-9d36-2a2ae2dbcce4",
+			"version": [
+				0,
+				0,
+				1
+			]
+		},
+    {
+      "type": "script",
+      "uuid": "a7b34375-f910-4000-889e-162600af5bcf",
+      "entry": "scripts/main.js",
+      "version": [ 1, 0, 0 ]
+    }
+	],
+	"dependencies": [
+	        {
+      "module_name": "@minecraft/server",
+      "version": "2.0.0"
+    },
+		{
+			"version": [
+				0,
+				0,
+				1
+			],
+			"uuid": "1401933c-dda7-11e9-8a34-2a2ae2dbcce4"
+		}
+	],
+	"metadata": {
+		"authors": [
+			"Gavin"
+		]
+	}
+}
