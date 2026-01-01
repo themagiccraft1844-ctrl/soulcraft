@@ -19,7 +19,7 @@
 			"minecraft:destructible_by_explosion": {
 				"explosion_resistance": 10
 			},
-			"minecraft:friction": 0.7,
+			"minecraft:friction": 0.5,
 			"minecraft:geometry": "geometry.block",
 			"minecraft:material_instances": {
 				"*": {

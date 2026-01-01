@@ -13,10 +13,11 @@
 			"minecraft:destructible_by_mining": {
 				"seconds_to_destroy": 1
 			},
+			"minecraft:loot": "loot_tables/blocks/half.json",
 			"minecraft:destructible_by_explosion": {
 				"explosion_resistance": 10
 			},
-			"minecraft:friction": 0.7,
+			"minecraft:friction": 0.3,
 			"minecraft:geometry": "geometry.block",
 			"minecraft:material_instances": {
 				"*": {

@@ -1,7 +1,7 @@
 // BP/scripts/modules/empty_soul_sand_logic.js
 
-import { world, system, BlockPermutation, LiquidType } from "@minecraft/server";
-import { distanceSquared, getUniqueKeyFromLocation, isBlockAnchored } from './location_utils'; 
+import { world, system, BlockPermutation } from "@minecraft/server";
+import { getUniqueKeyFromLocation, isBlockAnchored, distanceSquared } from './location_utils'; 
 import { 
     getOrCreateClimateSensor, 
     removeClimateSensor,
@@ -11,12 +11,9 @@ import {
 import { FreezingManager } from "./freeze_utils"; 
 import { cleanupWaterOnAnchorBreak } from "./keeps_water_utils"; 
 import { handleNetherWaterPlacement } from "./nether_water_placement.js";
-import { cancelJobsAtLocation } from "./queue_processors.js";
+import { unregisterRandomTickJob } from "./queue_processors.js";
 
-console.log(`[DEBUG empty_soul_sand_logic] Script empty_soul_sand_logic.js mulai dimuat di top-level. Tick: ${system.currentTick}`);
-
-
-// --- Variabel Konfigurasi dan Global untuk Logika Empty Soul Sand ---
+// --- KONFIGURASI ---
 const SOUL_SAND_ID = "minecraft:soul_sand";
 const REQUIRED_DEATHS = 4;
 
@@ -32,30 +29,16 @@ const SOUL_SAND_BLOCK_TYPES = [
     ALMOST_FULL_SOUL_SAND
 ];
 
-const SENSOR_ENTITY_ID = "soulcraft:temp_sensor";
+// Map Utama: Key = "x,y,z", Value = SoulSandData Instance
 let activeMakers = new Map(); 
-const soulSandTickHandlers = new Map();
 
-const pendingBreakConfirmations = new Map();
-const CONFIRMATION_TIMEOUT_TICKS = 100; 
-
-const CONFIG = {
-    ANCHOR_CHECK_RADIUS: 5, 
-    XP_ORB_KILL_RADIUS: 7, 
-    WATER_REMOVE_RADIUS_ON_BREAK: 8, 
-    WATER_REMOVAL_BATCH_SIZE: 10,
-};
-
-
-// --- Kelas SoulSandData (Logika Inti untuk Setiap Anchor) ---
 class SoulSandData {
-    constructor(location, dimension, tickHandlerId, climateSensorId = null, initialDeathCount = 0) {
+    constructor(location, dimension, initialDeathCount = 0) {
         this.location = location;
         this.dimension = dimension;
-        this.tickHandler = tickHandlerId;
         this.deathCount = initialDeathCount;
-        this._climateSensorId = climateSensorId;
-
+        this.sensorEntityId = null;
+        
         if (this.dimension.id !== "minecraft:nether") {
             this.freezingManager = new FreezingManager(this.location, this.dimension, activeMakers);
         } else {
@@ -63,311 +46,280 @@ class SoulSandData {
         }
     }
 
-    _getClimateSensorEntity() {
-        if (this.dimension.id === "minecraft:nether") return null;
-        if (this._climateSensorId) {
-            try {
-                const sensor = world.getEntity(this._climateSensorId);
-                if (sensor && sensor.isValid) return sensor;
-            } catch (e) {}
-        }
-        return null;
-    }
-
     async getClimateVariant() {
         if (this.dimension.id === "minecraft:the_end") return "temperate";
-        if (this.dimension.id === "minecraft:overworld") {
-            let currentSensor = this._getClimateSensorEntity();
-            if (!currentSensor || !currentSensor.isValid) {
-                currentSensor = await getOrCreateClimateSensor(this.location, this.dimension);
-                this._climateSensorId = currentSensor ? currentSensor.id : null;
-            }
-            return getClimateVariantFromSensor(currentSensor) || "temperate";
+        if (this.dimension.id === "minecraft:nether") return "warm";
+
+        let sensor = null;
+        if (this.sensorEntityId) sensor = world.getEntity(this.sensorEntityId);
+        if (!sensor || !sensor.isValid) {
+            sensor = await getOrCreateClimateSensor(this.location, this.dimension);
+            if (sensor) this.sensorEntityId = sensor.id;
         }
-        return "temperate";
+
+        return getClimateVariantFromSensor(sensor) || "temperate";
     }
 
-    async handleBehavior() { 
-        // Fungsi ini sengaja dikosongkan untuk performa, karena pembekuan
-        // sekarang dipicu oleh event. Namun, fungsi ini tetap ada untuk
-        // menjaga struktur dan stabilitas re-registrasi.
+    async refreshBehavior() {
+        if (!this.freezingManager) return;
+        const climate = await this.getClimateVariant();
+        this.freezingManager.triggerSmartFreezeScan(climate);
     }
 
     addDeath() {
         this.deathCount++;
         const block = this.dimension.getBlock(this.location);
+        
         if (block && block.isValid) {
             const newBlockMap = { 1: QUARTER_SOUL_SAND, 2: HALF_SOUL_SAND, 3: ALMOST_FULL_SOUL_SAND, 4: SOUL_SAND_ID };
             const newBlockId = newBlockMap[this.deathCount];
             if (newBlockId) {
-                if (this.deathCount >= REQUIRED_DEATHS) this.convertToSoulSand();
-                else system.run(() => block.setPermutation(BlockPermutation.resolve(newBlockId)));
+                if (this.deathCount >= REQUIRED_DEATHS) {
+                    this.convertToSoulSand();
+                } else {
+                    system.run(() => {
+                        if(block.isValid) block.setPermutation(BlockPermutation.resolve(newBlockId));
+                    });
+                }
             }
         }
     }
 
-    _cleanupHandlersAndData() {
-        const key = getUniqueKeyFromLocation(this.location);
-        if (this.tickHandler) {
-            system.clearRun(this.tickHandler);
-            soulSandTickHandlers.delete(key);
-            this.tickHandler = null;
-        }
-        activeMakers.delete(key);
-        if (this.dimension.id === "minecraft:overworld" && this._climateSensorId) {
-            const sensorEntity = this._getClimateSensorEntity();
-            if (sensorEntity && sensorEntity.isValid) removeClimateSensor(sensorEntity);
-        }
-    }
-
-    async convertToSoulSand() { 
+    async convertToSoulSand() {
         const { location, dimension, freezingManager } = this;
         const climate = await this.getClimateVariant();
-        this._cleanupHandlersAndData(); 
+        this.cleanup();
+
         system.run(() => {
             const block = dimension.getBlock(location);
             if (block && block.isValid) block.setPermutation(BlockPermutation.resolve(SOUL_SAND_ID));
         });
-        cleanupWaterOnAnchorBreak(location, dimension, activeMakers);
-        if (freezingManager) freezingManager.triggerMeltProcess(climate, this);
+
+        if (dimension.id === "minecraft:nether") {
+            cleanupWaterOnAnchorBreak(location, dimension, activeMakers);
+        } else if (freezingManager) {
+            freezingManager.triggerMeltProcess(climate);
+        }
+    }
+
+    cleanup() {
+        const key = getUniqueKeyFromLocation(this.location);
+        unregisterRandomTickJob(key);
+        activeMakers.delete(key);
+        if (this.dimension.id === "minecraft:overworld") {
+            removeClimateSensor(this.location, this.dimension);
+        }
     }
 }
 
-async function autoSpawnMissingSensors() {
-    for (const [key, makerData] of activeMakers.entries()) {
-        if (makerData.dimension.id === "minecraft:nether") continue;
-        try {
-            const block = makerData.dimension.getBlock(makerData.location);
-            if (!block || !block.isValid || !SOUL_SAND_BLOCK_TYPES.includes(block.typeId)) {
-                makerData._cleanupHandlersAndData();
-                continue;
-            }
-            let sensorEntity = makerData._getClimateSensorEntity();
-            if (!sensorEntity || !sensorEntity.isValid) {
-                const newSensor = await getOrCreateClimateSensor(makerData.location, makerData.dimension);
-                if (newSensor && newSensor.isValid) makerData._climateSensorId = newSensor.id;
-            }
-        } catch(e) {}
-    }
+// --- INITIALIZATION ---
+
+function registerAnchor(block, dimension) {
+    const key = getUniqueKeyFromLocation(block.location);
+    if (activeMakers.has(key)) return activeMakers.get(key);
+
+    const deathCount = SOUL_SAND_BLOCK_TYPES.indexOf(block.typeId);
+    const data = new SoulSandData(block.location, dimension, deathCount);
+    activeMakers.set(key, data);
+    
+    // Trigger behavior awal dengan delay
+    system.runTimeout(() => { data.refreshBehavior(); }, 10);
+    return data;
 }
 
-// --- Pemicu Pemindaian ---
-async function triggerScanForAnchor(anchorData) {
-    if (anchorData && anchorData.freezingManager) {
-        const climate = await anchorData.getClimateVariant();
-        anchorData.freezingManager.triggerSmartFreezeScan(climate, anchorData);
-    }
-}
+// --- RESTORATION LOGIC (RELOAD WORLD FIX) ---
 
-// --- World Initialization & Cleanup ---
-async function initializeExistingEmptySoulSandBlocks() {
-    const dimensions = [world.getDimension('overworld'), world.getDimension('the_end')];
+function restoreStateFromSensors() {
+    const dimensions = [world.getDimension('overworld'), world.getDimension('nether')];
+    
     for (const dim of dimensions) {
         try {
-            const sensors = dim.getEntities({ type: SENSOR_ENTITY_ID });
+            const sensors = dim.getEntities({ type: "soulcraft:temp_sensor" });
+            
             for (const sensor of sensors) {
                 if (!sensor.isValid) continue;
+                
+                const loc = sensor.location;
                 try {
-                    const block = dim.getBlock(sensor.location);
+                    const block = dim.getBlock(loc);
                     if (block && SOUL_SAND_BLOCK_TYPES.includes(block.typeId)) {
-                        const key = getUniqueKeyFromLocation(block.location);
+                        const key = getUniqueKeyFromLocation(loc);
                         if (!activeMakers.has(key)) {
-                            const deathCount = SOUL_SAND_BLOCK_TYPES.indexOf(block.typeId);
-                            const tickHandler = system.runInterval(() => {
-                                if (activeMakers.has(key)) activeMakers.get(key).handleBehavior();
-                            }, 5);
-                            const anchorData = new SoulSandData(block.location, dim, tickHandler, sensor.id, deathCount);
-                            activeMakers.set(key, anchorData);
-                            soulSandTickHandlers.set(key, tickHandler);
-                            
-                            // PERUBAHAN: Panggil fungsi pemulihan es dan pemicu pembekuan
-                            if (anchorData.freezingManager) {
-                                anchorData.freezingManager.repopulateIceDataOnReload();
-                            }
-                            await triggerScanForAnchor(anchorData);
+                            const data = registerAnchor(block, dim);
+                            data.sensorEntityId = sensor.id;
                         }
                     } else {
                         removeClimateSensor(sensor);
                     }
                 } catch (e) {}
             }
-        }
-        catch (e) {}
+        } catch (e) {}
     }
 }
 
-system.runTimeout(() => {
-    system.runTimeout(() => {
-        initializeExistingEmptySoulSandBlocks();
-    }, 40);
+function scanAreaAround(center, dimension, radius) {
+    const rangeY = 8; 
+    
+    for (let x = -radius; x <= radius; x++) {
+        for (let y = -rangeY; y <= rangeY; y++) {
+            for (let z = -radius; z <= radius; z++) {
+                const loc = { 
+                    x: Math.floor(center.x + x), 
+                    y: Math.floor(center.y + y), 
+                    z: Math.floor(center.z + z) 
+                };
 
-    let playerInteractWithBlockSubscribeIntervalId = system.runInterval(() => {
-        world.beforeEvents.playerInteractWithBlock.subscribe(async (event) => {
-            const { player, itemStack, block } = event;
-            if (player.dimension.id === "minecraft:nether" && itemStack?.typeId === "minecraft:water_bucket") {
-                handleNetherWaterPlacement(event, activeMakers, SOUL_SAND_BLOCK_TYPES, SoulSandData, soulSandTickHandlers);
-            }
-            const anchorData = findNearbyAnchor(block.location, block.dimension);
-            if (anchorData) await triggerScanForAnchor(anchorData);
-        });
-        system.clearRun(playerInteractWithBlockSubscribeIntervalId);
-    }, 1);
-
-    system.runInterval(() => {
-        const currentTick = system.currentTick;
-        for (const [key, data] of pendingBreakConfirmations.entries()) {
-            if (currentTick - data.timestamp > CONFIRMATION_TIMEOUT_TICKS) {
-                pendingBreakConfirmations.delete(key);
-            }
-        }
-    }, 20); 
-
-    world.afterEvents.playerPlaceBlock.subscribe(async (event) => { 
-        if (event.block.typeId === BLOCK_ID) {
-            const { block } = event;
-            const key = getUniqueKeyFromLocation(block.location);
-            cancelJobsAtLocation(block.location);
-            let climateSensorEntity = null;
-            if (block.dimension.id !== "minecraft:nether") {
-                climateSensorEntity = await getOrCreateClimateSensor(block.location, block.dimension);
-            }
-            const tickHandler = system.runInterval(() => {
-                if (activeMakers.has(key)) {
-                    activeMakers.get(key).handleBehavior();
-                }
-            }, 5);
-            const anchorData = new SoulSandData(block.location, block.dimension, tickHandler, climateSensorEntity?.id, 0);
-            activeMakers.set(key, anchorData);
-            soulSandTickHandlers.set(key, tickHandler);
-            await triggerScanForAnchor(anchorData);
-        } else {
-            const anchorData = findNearbyAnchor(event.block.location, event.dimension);
-            if (anchorData) await triggerScanForAnchor(anchorData);
-        }
-    });
-
-    world.beforeEvents.playerBreakBlock.subscribe((event) => {
-        const { block } = event;
-        const blockLocationKey = getUniqueKeyFromLocation(block.location);
-        if (SOUL_SAND_BLOCK_TYPES.includes(block.typeId)) {
-            if (!activeMakers.has(blockLocationKey)) {
-                console.warn(`[RECOVERY_WARN] Menghancurkan blok kustom tak terlacak di ${blockLocationKey}. Mencoba mendaftarkan ulang.`);
-                let deathCount = SOUL_SAND_BLOCK_TYPES.indexOf(block.typeId);
-                const tickHandler = system.runInterval(() => {
-                    if (activeMakers.has(blockLocationKey)) activeMakers.get(blockLocationKey).handleBehavior();
-                }, 5);
-                const soulSandData = new SoulSandData(block.location, event.dimension, tickHandler, null, deathCount);
-                activeMakers.set(blockLocationKey, soulSandData);
-                soulSandTickHandlers.set(blockLocationKey, tickHandler);
-            }
-        }
-    });
-
-    world.afterEvents.playerBreakBlock.subscribe(async (event) => {
-        system.runTimeout(async () => {
-            const { brokenBlockPermutation, dimension, block } = event;
-            const key = getUniqueKeyFromLocation(block.location);
-            if (SOUL_SAND_BLOCK_TYPES.includes(brokenBlockPermutation.type.id)) {
-                const anchorData = activeMakers.get(key);
-                if (anchorData) {
-                    const climate = await anchorData.getClimateVariant();
-                    if (anchorData.freezingManager) anchorData.freezingManager.triggerMeltProcess(climate, anchorData);
-                    anchorData._cleanupHandlersAndData();
-                    cleanupWaterOnAnchorBreak(block.location, dimension, activeMakers);
-                }
-            } else {
-                const anchorData = findNearbyAnchor(block.location, dimension);
-                if (anchorData) await triggerScanForAnchor(anchorData);
-            }
-        }, 1);
-    });
-
-    world.afterEvents.entityDie.subscribe((event) => {
-        const deadEntity = event.deadEntity;
-        if (deadEntity && deadEntity.isValid && deadEntity.hasComponent('minecraft:health')) { 
-            const mobLocation = { x: deadEntity.location.x, y: deadEntity.location.y, z: deadEntity.location.z };
-            const mobDimension = deadEntity.dimension;
-            let foundRelevantMaker = false;
-            if (mobDimension.id !== "minecraft:nether") {
-                for (const [key, makerData] of activeMakers.entries()) { 
-                    if (makerData.dimension.id !== deadEntity.dimension.id) continue;
-                    const distSq = distanceSquared(mobLocation, makerData.location);
-                    if (!isNaN(distSq) && distSq <= 49) {
-                        makerData.addDeath();
-                        try { mobDimension.spawnParticle("minecraft:soul_particle", mobLocation); } catch (e) {}
-                        foundRelevantMaker = true;
-                        break;
-                    }
-                }
-            }
-            else {
-                const scanRadius = 7;
-                const startScan = { x: Math.floor(mobLocation.x) - scanRadius, y: Math.floor(mobLocation.y) - scanRadius, z: Math.floor(mobLocation.z) - scanRadius };
-                const endScan = { x: Math.floor(mobLocation.x) + scanRadius, y: Math.floor(mobLocation.y) + scanRadius, z: Math.floor(mobLocation.z) + scanRadius };
                 try {
-                    for (let x = startScan.x; x <= endScan.x; x++) {
-                        for (let y = startScan.y; y <= endScan.y; y++) {
-                            for (let z = startScan.z; z <= endScan.z; z++) {
-                                const block = mobDimension.getBlock({ x, y, z });
-                                if (block && block.isValid && SOUL_SAND_BLOCK_TYPES.includes(block.typeId)) {
-                                    const key = getUniqueKeyFromLocation(block.location);
-                                    let makerData = activeMakers.get(key);
-                                    if (!makerData) {
-                                        let deathCount = SOUL_SAND_BLOCK_TYPES.indexOf(block.typeId);
-                                        const tickHandler = system.runInterval(() => {
-                                            if (activeMakers.has(key)) activeMakers.get(key).handleBehavior();
-                                        }, 5);
-                                        makerData = new SoulSandData(block.location, mobDimension, tickHandler, null, deathCount);
-                                        activeMakers.set(key, makerData);
-                                        soulSandTickHandlers.set(key, tickHandler);
-                                    }
-                                    makerData.addDeath();
-                                    try { mobDimension.spawnParticle("minecraft:soul_particle", mobLocation); } catch (e) {}
-                                    foundRelevantMaker = true;
-                                    break;
-                                }
-                            }
-                            if (foundRelevantMaker) break;
+                    const block = dimension.getBlock(loc);
+                    if (block && SOUL_SAND_BLOCK_TYPES.includes(block.typeId)) {
+                        const key = getUniqueKeyFromLocation(loc);
+                        if (!activeMakers.has(key)) {
+                            registerAnchor(block, dimension);
                         }
-                        if (foundRelevantMaker) break;
                     }
                 } catch (e) {}
             }
         }
-    });
-
-    system.runInterval(() => {
-        const dimensions = [world.getDimension('overworld'), world.getDimension('nether'), world.getDimension('the_end')];
-        for (const dim of dimensions) {
-            try {
-                for (const [key, makerData] of activeMakers.entries()) {
-                    if (makerData.dimension.id !== dim.id) continue;
-                    const nearbyOrbs = dim.getEntities({ type: "minecraft:xp_orb", location: makerData.location, maxDistance: 7 });
-                    for (const orb of nearbyOrbs) {
-                        if (orb.isValid) orb.remove();
-                    }
-                }
-            } catch (e) { /* ignore */ }
-        }
-    }, 10);
-}, 1);
-
-function findNearbyAnchor(location, dimension, radius = 5) {
-    for (const [key, anchor] of activeMakers.entries()) {
-        if (anchor.dimension.id === dimension.id) {
-            const dx = Math.abs(anchor.location.x - location.x);
-            const dy = Math.abs(anchor.location.y - location.y);
-            const dz = Math.abs(anchor.location.z - location.z);
-            if (dx <= radius && dy <= radius && dz <= radius) return anchor;
-        }
     }
-    return null;
 }
-    
-system.runInterval(() => {
-    try {
-        autoSpawnMissingSensors();
-    } catch (e) {
-        console.error(`[RECOVERY_FATAL] Error saat menjalankan autoSpawnMissingSensors: ${e.message}`);
+
+// --- EVENT HANDLERS ---
+
+world.afterEvents.playerSpawn.subscribe((event) => {
+    scanAreaAround(event.player.location, event.player.dimension, 8);
+    restoreStateFromSensors();
+});
+
+
+world.afterEvents.playerPlaceBlock.subscribe(async (event) => {
+    if (SOUL_SAND_BLOCK_TYPES.includes(event.block.typeId)) {
+        const data = registerAnchor(event.block, event.dimension);
+        await data.getClimateVariant();
+        data.refreshBehavior();
+    } else {
+        checkNearbyAndTrigger(event.block.location, event.dimension);
     }
-}, 600);
+});
+
+world.afterEvents.playerBreakBlock.subscribe((event) => {
+    const { brokenBlockPermutation, block, dimension } = event;
+    
+    if (SOUL_SAND_BLOCK_TYPES.includes(brokenBlockPermutation.type.id)) {
+        const key = getUniqueKeyFromLocation(block.location);
+        
+        const tempManager = new FreezingManager(block.location, dimension, activeMakers);
+        tempManager.triggerMeltProcess("temperate"); 
+        
+        removeClimateSensor(block.location, dimension);
+        activeMakers.delete(key);
+
+        if (dimension.id === "minecraft:nether") {
+            cleanupWaterOnAnchorBreak(block.location, dimension, activeMakers);
+        }
+    } else {
+        checkNearbyAndTrigger(block.location, dimension);
+    }
+});
+
+// [PERBAIKAN ERROR]: Logic ini berjalan di beforeEvents (read-only)
+// Fungsi checkNearbyAndTrigger bisa memicu spawnEntity (lewat registerAnchor -> getClimateSensor)
+// Jadi harus di-defer (system.run) agar tidak crash.
+world.beforeEvents.playerInteractWithBlock.subscribe((event) => {
+    if (event.player.dimension.id === "minecraft:nether" && event.itemStack?.typeId === "minecraft:water_bucket") {
+        // handleNetherWaterPlacement sudah menangani deferral di dalamnya sendiri untuk side-effects
+        handleNetherWaterPlacement(event, activeMakers, SOUL_SAND_BLOCK_TYPES, SoulSandData, null);
+    }
+    
+    // Bungkus trigger update ini agar berjalan di tick berikutnya (safe context)
+    system.run(() => {
+        try {
+            checkNearbyAndTrigger(event.block.location, event.player.dimension);
+        } catch(e) {}
+    });
+});
+
+world.afterEvents.entityDie.subscribe((event) => {
+    const { deadEntity } = event;
+    if (!deadEntity.isValid) return;
+
+    const dim = deadEntity.dimension;
+    const loc = deadEntity.location;
+    let found = false;
+    
+    for (const [key, data] of activeMakers) {
+        if (data.dimension.id !== dim.id) continue;
+        if (distanceSquared(loc, data.location) <= 49) { 
+            data.addDeath();
+            try { dim.spawnParticle("minecraft:soul_particle", loc); } catch(e){}
+            found = true;
+            break; 
+        }
+    }
+});
+
+function checkNearbyAndTrigger(location, dimension) {
+    const range = 6;
+    for (const [key, data] of activeMakers) {
+        if (data.dimension.id !== dimension.id) continue;
+        if (distanceSquared(location, data.location) <= (range * range)) {
+            data.refreshBehavior();
+        }
+    }
+    scanAreaAround(location, dimension, 3);
+}
+
+// --- INTERVAL GLOBAL & CLEANUP ---
+
+let tickCount = 0;
+
+system.runInterval(() => {
+    tickCount++;
+    const dimensions = [world.getDimension('overworld'), world.getDimension('nether'), world.getDimension('the_end')];
+    
+    if (tickCount % 40 === 0) {
+        restoreStateFromSensors();
+    }
+
+    for (const dim of dimensions) {
+        try {
+            for(const player of dim.getPlayers()) {
+                 const xpOrbs = dim.getEntities({ type: "minecraft:xp_orb", location: player.location, maxDistance: 10 });
+                 for (const orb of xpOrbs) {
+                    if(!orb.isValid) continue;
+                    let kill = false;
+                    for (const [key, maker] of activeMakers) {
+                        if(maker.dimension.id !== dim.id) continue;
+                        if(distanceSquared(orb.location, maker.location) <= 49) {
+                            kill = true; break;
+                        }
+                    }
+                    if(kill) try{orb.remove();}catch(e){}
+                }
+
+                if (dim.id !== "minecraft:nether") { 
+                    const rX = Math.floor(Math.random() * 10) - 5;
+                    const rY = Math.floor(Math.random() * 6) - 3; 
+                    const rZ = Math.floor(Math.random() * 10) - 5;
+                    
+                    const scanLoc = {
+                        x: player.location.x + rX,
+                        y: player.location.y + rY,
+                        z: player.location.z + rZ
+                    };
+
+                    try {
+                        const block = dim.getBlock(scanLoc);
+                        if(block && block.isValid && block.typeId === "minecraft:ice") {
+                            const anchored = isBlockAnchored(scanLoc, dim, activeMakers, null, 6);
+                            if (!anchored) {
+                                if (Math.random() < 0.2) { 
+                                    block.setPermutation(BlockPermutation.resolve("minecraft:flowing_water"));
+                                }
+                            }
+                        }
+                    } catch(e) {}
+                }
+            }
+        } catch(e) {}
+    }
+}, 10);

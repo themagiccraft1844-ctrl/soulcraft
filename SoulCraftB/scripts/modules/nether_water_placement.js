@@ -1,7 +1,9 @@
 // BP/scripts/modules/nether_water_placement.js
 
-import { world, system, BlockPermutation, LiquidType, ItemStack, Direction, MolangVariableMap } from "@minecraft/server";
-import { getUniqueKeyFromLocation, isBlockAnchored } from './location_utils';
+import { world, system, BlockPermutation, LiquidType, ItemStack, Direction, GameMode } from "@minecraft/server";
+import { getUniqueKeyFromLocation, isBlockAnchored, distanceSquared } from './location_utils';
+import { isCandidateBlocked } from './blocked_candidate_block.js';
+
 // --- Variabel & Fungsi Bantuan ---
 const LIQUID_BREAKABLE_BLOCKS = new Set([
     "minecraft:torch", "minecraft:redstone_torch", "minecraft:soul_torch", "minecraft:brown_mushroom",
@@ -38,26 +40,67 @@ function getVectorFromDirection(direction) {
     }
 }
 
+// Helper untuk memprediksi lokasi target air
+function getWaterTargetLocation(event) {
+    const { block, blockFace } = event;
+    if (LIQUID_BREAKABLE_BLOCKS.has(block.typeId)) {
+        return block.location;
+    } else if (block.canContainLiquid(LiquidType.Water) && !block.isWaterlogged && block.typeId !== "minecraft:air") {
+        return block.location;
+    } else {
+        return block.offset(getVectorFromDirection(blockFace));
+    }
+}
+
 /**
  * Fungsi utama yang menangani logika penempatan air di Nether.
- * @param {import("@minecraft/server").PlayerInteractWithBlockBeforeEvent} event - Event dari interaksi pemain.
- * @param {Map<string, any>} activeMakers - Referensi ke peta anchor yang aktif.
- * @param {string[]} SOUL_SAND_BLOCK_TYPES - Array tipe blok anchor.
- * @param {any} SoulSandData - Referensi ke kelas SoulSandData untuk membuat instance baru.
- * @param {Map<string, number>} soulSandTickHandlers - Referensi ke peta tick handler.
  */
 export function handleNetherWaterPlacement(event, activeMakers, SOUL_SAND_BLOCK_TYPES, SoulSandData, soulSandTickHandlers) {
-    const { player, block } = event;
+    const { player, block, itemStack } = event;
+    const dimension = player.dimension;
     const radius = 5;
+
+    // Safety check
+    if (itemStack?.typeId !== 'minecraft:water_bucket') return;
+
     let anchorFound = false;
 
-    // 1. Cek dulu dengan isBlockAnchored yang lebih efisien
-    if (isBlockAnchored(block.location, player.dimension, activeMakers, null, radius)) {
-        placeWater(event);
-        return;
+    // Lokasi target air untuk validasi blockage
+    const targetLoc = getWaterTargetLocation(event);
+    const targetBlock = dimension.getBlock(targetLoc);
+    
+    if (!targetBlock || !targetBlock.isValid) return;
+
+    // --- STEP 1: Cek Anchor yang Sudah Aktif ---
+    let nearestActiveAnchor = null;
+    let minDistance = Infinity;
+
+    for (const [key, maker] of activeMakers) {
+        if (maker.dimension.id !== dimension.id) continue;
+        const d = distanceSquared(targetLoc, maker.location);
+        if (d <= radius * radius) {
+            if (d < minDistance) {
+                minDistance = d;
+                nearestActiveAnchor = maker;
+            }
+        }
     }
 
-    // 2. Jika tidak ada anchor aktif, lakukan pemindaian manual
+    if (nearestActiveAnchor) {
+        // [FITUR BARU] Validasi Penghalang (Blocked Candidate)
+        if (!isCandidateBlocked(targetBlock, nearestActiveAnchor.location, dimension)) {
+             placeWater(event);
+             return;
+        } else {
+            // TERBLOKIR: Tampilkan partikel marah, jangan place water (biarkan menguap vanilla)
+            system.run(() => {
+                try { dimension.spawnParticle("minecraft:villager_angry", targetLoc); } catch(e){}
+            });
+            return; 
+        }
+    }
+
+    // --- STEP 2: Scan Manual (Lazy Load / Registrasi Baru) ---
     for (let x = -radius; x <= radius; x++) {
         for (let y = -radius; y <= radius; y++) {
             for (let z = -radius; z <= radius; z++) {
@@ -65,20 +108,27 @@ export function handleNetherWaterPlacement(event, activeMakers, SOUL_SAND_BLOCK_
                 try {
                     const nearbyBlock = player.dimension.getBlock(checkLoc);
                     if (nearbyBlock && SOUL_SAND_BLOCK_TYPES.includes(nearbyBlock.typeId)) {
-                        const nearbyBlockKey = getUniqueKeyFromLocation(nearbyBlock.location);
-                        if (!activeMakers.has(nearbyBlockKey)) {
-                            // 3. Daftarkan blok yang tidak aktif
-                            let deathCount = SOUL_SAND_BLOCK_TYPES.indexOf(nearbyBlock.typeId);
-                            const tickHandler = system.runInterval(() => {
-                                if (activeMakers.has(nearbyBlockKey)) activeMakers.get(nearbyBlockKey).handleBehavior();
-                            }, 5);
-                            const soulSandData = new SoulSandData(nearbyBlock.location, player.dimension, tickHandler, null, deathCount);
-                            activeMakers.set(nearbyBlockKey, soulSandData);
-                            soulSandTickHandlers.set(nearbyBlockKey, tickHandler);
+                        
+                        // Validasi Blockage SEBELUM registrasi
+                        if (!isCandidateBlocked(targetBlock, nearbyBlock.location, dimension)) {
+                            
+                            const nearbyBlockKey = getUniqueKeyFromLocation(nearbyBlock.location);
+                            if (!activeMakers.has(nearbyBlockKey)) {
+                                let deathCount = SOUL_SAND_BLOCK_TYPES.indexOf(nearbyBlock.typeId);
+                                const tickHandler = system.runInterval(() => {
+                                    if (activeMakers.has(nearbyBlockKey)) activeMakers.get(nearbyBlockKey).handleBehavior();
+                                }, 5);
+                                
+                                const soulSandData = new SoulSandData(nearbyBlock.location, player.dimension, deathCount);
+                                soulSandData.tickHandler = tickHandler; 
+                                
+                                activeMakers.set(nearbyBlockKey, soulSandData);
+                                soulSandTickHandlers.set(nearbyBlockKey, tickHandler);
+                            }
+                            anchorFound = true;
+                            placeWater(event);
+                            return; 
                         }
-                        anchorFound = true;
-                        placeWater(event);
-                        break;
                     }
                 } catch (e) { /* Abaikan */ }
             }
@@ -90,10 +140,9 @@ export function handleNetherWaterPlacement(event, activeMakers, SOUL_SAND_BLOCK_
 
 /**
  * Fungsi internal untuk menjalankan aksi penempatan air.
- * @param {import("@minecraft/server").PlayerInteractWithBlockBeforeEvent} event 
  */
 function placeWater(event) {
-    event.cancel = true;
+    event.cancel = true; // KUNCI: Batalkan event vanilla agar air tidak menguap
     const { player, block, blockFace } = event;
     let finalTargetLoc;
 
@@ -128,8 +177,33 @@ function placeWater(event) {
             
             if (waterPlaced) {
                 player.dimension.playSound("bucket.empty_water", finalTargetLoc);
-                const particleLoc = finalTargetLoc.offset({ x: 0, y: 1, z: 0 });
-                player.dimension.spawnParticle("minecraft:bubble_column_down_particle", particleLoc);
+                const particleLoc = finalTargetLoc.offset({ x: 1, y: 1, z: 1 });
+                try { player.dimension.spawnParticle("minecraft:bubble_column_down_particle", particleLoc); } catch(e) {}
+
+                // --- LOGIKA PENGURANGAN ITEM ---
+                const gameMode = player.getGameMode();
+                const inventory = player.getComponent("minecraft:inventory")?.container;
+                
+                if (inventory) {
+                    const slot = player.selectedSlotIndex;
+                    const item = inventory.getItem(slot);
+
+                    // SURVIVAL / ADVENTURE CHECK
+                    // Menggunakan GameMode.Creative untuk keamanan
+                    if (gameMode !== GameMode.Creative) { 
+                        if (item && item.typeId === "minecraft:water_bucket") {
+                             if (item.amount > 1) {
+                                 item.amount -= 1;
+                                 inventory.setItem(slot, item);
+                                 try { inventory.addItem(new ItemStack("minecraft:bucket", 1)); } 
+                                 catch (err) { player.dimension.spawnItem(new ItemStack("minecraft:bucket", 1), player.location); }
+                             } else {
+                                 // Ganti stack 1 water bucket dengan bucket kosong
+                                 inventory.setItem(slot, new ItemStack("minecraft:bucket", 1));
+                             }
+                        }
+                    } 
+                }
             }
         } catch (e) {
             console.error(`[ERROR] Error menempatkan air di Nether: ${e.message}`);

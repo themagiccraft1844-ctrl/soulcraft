@@ -1,112 +1,50 @@
 // BP/scripts/modules/water_utils.js
 
-import { world } from '@minecraft/server'; // Hanya untuk type hints dan mungkin debug jika diperlukan
+import { world } from '@minecraft/server';
 
 /**
- * Helper function untuk mengecek apakah blok air adalah "sumber air sejati" atau "puncak air terjun" yang bisa dibekukan.
- * @param {import("@minecraft/server").Vector3} blockLocation - Lokasi blok air yang akan dicek.
- * @param {import("@minecraft/server").Dimension} dimension - Dimensi tempat blok berada.
- * @param {number} [depth=0] - Kedalaman rekursi untuk mencegah loop tak terbatas.
- * @returns {boolean} True jika blok air adalah sumber sejati yang bisa dibekukan, false jika tidak.
+ * Mengecek apakah blok adalah sumber air yang valid untuk dibekukan.
+ * Logika Anti-Cheat:
+ * Hanya mengizinkan "Source Water" (Level 0) untuk dibekukan.
+ * Air mengalir (Stream/Waterfall) dengan level 1-7 akan diabaikan.
+ * Ini mencegah pemain membuat generator es tak terbatas dari satu ember air.
  */
-export function isFreezeableWaterSource(blockLocation, dimension, depth = 0) {
-    if (depth > 5) { // Batasi kedalaman rekursi
-        return true; // Asumsikan bisa dibekukan jika rekursi terlalu dalam
+export function isFreezeableWaterSource(block, dimension) {
+    if (!block || !block.isValid) return false;
+
+    const typeId = block.typeId;
+    
+    // 1. Filter Tipe Blok: Harus air
+    if (typeId !== "minecraft:water" && typeId !== "minecraft:flowing_water") {
+        return false;
     }
 
-    const horizontalOffsets = [
-        { x: 1, y: 0, z: 0 }, { x: -1, y: 0, z: 0 },
-        { x: 0, y: 0, z: 1 }, { x: 0, y: 0, z: -1 }
-    ];
-
-    let hasHorizontalAirOrFlowingWater = false;
-    for (const offset of horizontalOffsets) {
-        const adjacentLoc = { x: blockLocation.x + offset.x, y: blockLocation.y + offset.y, z: blockLocation.z + offset.z };
-        try {
-            // Gunakan getBlockFromLocation
-            const adjacentBlock = dimension.getBlockFromLocation(adjacentLoc);
-            if (adjacentBlock && adjacentBlock.isValid && (adjacentBlock.typeId === "minecraft:air" || adjacentBlock.typeId === "minecraft:flowing_water")) {
-                hasHorizontalAirOrFlowingWater = true;
-                break;
-            }
-        } catch (e) { /* ignore errors from unloaded chunks */ }
-    }
-
-    const blockBelowLoc = { x: blockLocation.x, y: blockLocation.y - 1, z: blockLocation.z };
-    let hasAirOrFlowingWaterBelow = false;
+    // 2. Filter State: Harus Source (Level 0)
+    // Di Bedrock, baik 'water' maupun 'flowing_water' memiliki state 'liquid_depth'.
+    // Nilai 0 = Source Block.
+    // Nilai 1-7 = Flowing levels.
     try {
-        // Gunakan getBlockFromLocation
-        const blockBelow = dimension.getBlockFromLocation(blockBelowLoc);
-        if (blockBelow && blockBelow.isValid && (blockBelow.typeId === "minecraft:air" || blockBelow.typeId === "minecraft:flowing_water")) {
-            hasAirOrFlowingWaterBelow = true;
-        }
-    } catch (e) { /* ignore errors from unloaded chunks */ }
+        const permutation = block.permutation;
+        const depth = permutation.getState("liquid_depth");
 
-    // Logika 1: Sumber air statis sejati (kolam)
-    if (!hasHorizontalAirOrFlowingWater && !hasAirOrFlowingWaterBelow) {
-        return true;
-    }
-
-    // Logika 2: Puncak Air Terjun (Waterfall Peak)
-    if (hasAirOrFlowingWaterBelow && !hasHorizontalAirOrFlowingWater) {
-        const blockAboveLoc = { x: blockLocation.x, y: blockLocation.y + 1, z: blockLocation.z };
-        try {
-            // Gunakan getBlockFromLocation
-            const blockAbove = dimension.getBlockFromLocation(blockAboveLoc);
-            if (blockAbove && blockAbove.isValid && (blockAbove.typeId === "minecraft:water" || blockAbove.typeId === "minecraft:flowing_water")) {
-                // Rekursif: Jika blok di atas adalah sumber yang bisa dibekukan, maka blok saat ini bukan puncak
-                if (isFreezeableWaterSource(blockAboveLoc, dimension, depth + 1)) {
-                    return false;
-                }
-            }
-        } catch (e) { /* ignore errors from unloaded chunks */ }
-        return true; // Jika tidak ada air di atas atau air di atas bukan sumber, ini adalah puncak
-    }
-
-    // Logika 3: Air di genangan yang memiliki satu sisi terbuka (misal lubang 1x2)
-    if (hasHorizontalAirOrFlowingWater && !hasAirOrFlowingWaterBelow) {
-        let openHorizontalSides = 0;
-        for (const offset of horizontalOffsets) {
-            const adjacentLoc = { x: blockLocation.x + offset.x, y: blockLocation.y + offset.y, z: blockLocation.z + offset.z };
-            try {
-                // Gunakan getBlockFromLocation
-                const adjacentBlock = dimension.getBlockFromLocation(adjacentLoc);
-                if (adjacentBlock && adjacentBlock.isValid && (adjacentBlock.typeId === "minecraft:air" || adjacentBlock.typeId === "minecraft:flowing_water")) {
-                    openHorizontalSides++;
-                }
-            } catch (e) { /* ignore errors from unloaded chunks */ }
-        }
-        if (openHorizontalSides === 1) { // Hanya satu sisi terbuka
+        // Hanya kembalikan True jika ini adalah Source Murni (0)
+        if (depth === 0) {
             return true;
         }
+    } catch (e) {
+        // Fallback jika terjadi error pengambilan state (jarang terjadi)
+        // Jika namanya "minecraft:water" (bukan flowing), biasanya itu source statis.
+        if (typeId === "minecraft:water") return true;
     }
+    
     return false;
 }
 
 /**
- * Helper function untuk mengecek apakah blok flowing_water adalah aliran alami (bukan player-placed).
- * @param {import("@minecraft/server").Vector3} blockLocation - Lokasi blok flowing_water yang akan dicek.
- * @param {import("@minecraft/server").Dimension} dimension - Dimensi tempat blok berada.
- * @returns {boolean} True jika flowing_water adalah aliran alami, false jika kemungkinan player-placed.
+ * Helper untuk mengecek apakah ini aliran alami.
+ * (Fungsi ini mungkin tidak lagi krusial jika kita sudah memfilter by liquid_depth, 
+ * tapi tetap dipertahankan untuk kompatibilitas logika lain jika ada).
  */
 export function isNaturalFlowingWater(blockLocation, dimension) {
-    const checkOffsets = [
-        { x: 0, y: -1, z: 0 }, // Bawah
-        { x: 1, y: 0, z: 0 },  // Timur
-        { x: -1, y: 0, z: 0 }, // Barat
-        { x: 0, y: 0, z: 1 },  // Selatan
-        { x: 0, y: 0, z: -1 }   // Utara
-    ];
-
-    for (const offset of checkOffsets) {
-        const adjacentLoc = { x: blockLocation.x + offset.x, y: blockLocation.y + offset.y, z: blockLocation.z + offset.z };
-        try {
-            // Gunakan getBlockFromLocation
-            const adjacentBlock = dimension.getBlockFromLocation(adjacentLoc);
-            if (adjacentBlock && adjacentBlock.isValid && (adjacentBlock.typeId === "minecraft:air" || adjacentBlock.typeId === "minecraft:flowing_water")) {
-                return true; // Jika ada udara atau air mengalir di sekitar, kemungkinan alami
-            }
-        } catch (e) { /* ignore errors from unloaded chunks */ }
-    }
-    return false;
+    return true; 
 }

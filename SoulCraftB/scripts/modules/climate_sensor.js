@@ -1,147 +1,87 @@
 // BP/scripts/modules/climate_sensor.js
 
-import { world, system, Entity, BlockPermutation } from '@minecraft/server'; // Import Entity dan BlockPermutation untuk type hinting
+import { world, system, Entity } from '@minecraft/server';
 
-const SENSOR_ENTITY_ID = "soulcraft:temp_sensor"; // Ganti dengan ID entitas sensor iklim yang sesuai
-const DESPAWN_EVENT_NAME = "soulcraft:trigger_despawn"; // Nama event kustom untuk despawn
+const SENSOR_ENTITY_ID = "soulcraft:temp_sensor";
+const DESPAWN_EVENT_NAME = "soulcraft:trigger_despawn";
 
-/**
- * Helper function untuk memetakan nilai varian numerik ke string iklim.
- * @param {number} variantValue - Nilai varian dari komponen minecraft:variant.
- * @returns {string} String iklim ("warm", "cold", "temperate").
- */
 function mapVariantToClimate(variantValue) {
     switch (variantValue) {
         case 0: return "warm";
         case 1: return "cold";
         case 2: return "temperate";
-        default: return "unknown"; // Fallback jika varian tidak sesuai
+        default: return "unknown";
     }
 }
 
 /**
- * Mencari entitas sensor iklim yang sudah ada di lokasi tertentu.
- * Jika tidak ditemukan, akan men-spawn yang baru dan menunggu propertinya diatur.
- * Entitas sensor hanya di-spawn di Overworld.
- * @param {import("@minecraft/server").Vector3} location - Koordinat {x, y, z} untuk di-cek/di-spawn.
- * @param {import("@minecraft/server").Dimension} dimension - Dimensi tempat lokasi berada.
- * @param {boolean} [autoDespawn=false] - Jika true, sensor akan otomatis despawn setelah propertinya siap (hanya untuk pengujian, biasanya tidak digunakan di sini).
- * @returns {Promise<import("@minecraft/server").Entity | null>} Objek entitas sensor, atau null jika gagal atau bukan Overworld.
+ * Mencari sensor. Jika tidak ada, SPAWN BARU.
+ * Dibuat sangat robust untuk menangani chunk reload.
  */
-export async function getOrCreateClimateSensor(location, dimension, autoDespawn = false) {
-    // Sensor hanya relevan di Overworld. Di Nether/The End, tidak perlu spawn.
+export async function getOrCreateClimateSensor(location, dimension) {
     if (dimension.id !== "minecraft:overworld") {
-        return null;
+        return null; // Nether/End handling berbeda
     }
 
-    // 1. Coba cari entitas sensor yang sudah ada di lokasi
+    // 1. Cari yang existing (instant check)
     try {
-        const existingSensors = dimension.getEntitiesAtBlockLocation(location); // Menggunakan getEntitiesAtBlockLocation
-        const filteredSensors = existingSensors.filter(entity => entity.typeId === SENSOR_ENTITY_ID && entity.isValid);
+        const existingSensors = dimension.getEntities({
+            type: SENSOR_ENTITY_ID,
+            location: location,
+            maxDistance: 2 // Radius sedikit diperluas untuk toleransi
+        });
 
-        if (filteredSensors.length > 0) {
-            const sensorEntity = filteredSensors[0];
-            const variantComponent = sensorEntity.getComponent("minecraft:variant");
-            if (variantComponent && typeof variantComponent.value === 'number') {
-                return sensorEntity;
-            } else {
-                console.warn(`[ClimateSensor] Menemukan sensor lama tanpa komponen variant yang siap di ${location.x},${location.y},${location.z}. Mencoba memicu despawn dan mengembalikan null untuk spawn ulang.`);
-                // Memastikan sensor yang tidak valid dihapus untuk menghindari duplikasi
-                system.run(() => {
-                    if (sensorEntity.isValid) {
-                        try {
-                            sensorEntity.triggerEvent(DESPAWN_EVENT_NAME);
-                        } catch (e) {
-                            console.error(`[ClimateSensor] Error triggering despawn for existing invalid sensor (${sensorEntity.id}): ${e.message}`);
-                        }
-                    }
-                });
-                return null;
+        if (existingSensors.length > 0) {
+            const sensor = existingSensors[0];
+            if (sensor.isValid) {
+                // Cek apakah varian sudah siap
+                const variant = sensor.getComponent("minecraft:variant");
+                if (variant && typeof variant.value === 'number') {
+                    return sensor;
+                }
             }
         }
-    } catch (e) {
-        console.error(`[ClimateSensor] Error mencari sensor yang sudah ada di ${location.x},${location.y},${location.z}: ${e.message}`);
-    }
+    } catch (e) { /* Chunk loading error possible */ }
 
-    // 2. Jika tidak ditemukan atau tidak valid, spawn yang baru
-    let sensorEntity = null;
+    // 2. Jika tidak ada, Spawn baru
+    // console.log(`[Climate] Spawning new sensor at ${location.x} ${location.z}`);
     try {
-        sensorEntity = dimension.spawnEntity(SENSOR_ENTITY_ID, location);
-
-        return new Promise(resolve => {
-            const timeoutTicks = 100; // 5 detik
-            let currentTicks = 0;
-            const checkInterval = system.runInterval(() => {
-                if (!sensorEntity.isValid) {
-                    console.warn(`[ClimateSensor] Sensor tidak valid saat menunggu komponen variant di ${location.x},${location.y},${location.z}.`);
-                    system.clearRun(checkInterval);
-                    resolve(null);
+        const newSensor = dimension.spawnEntity(SENSOR_ENTITY_ID, location);
+        
+        // Tunggu komponen variant siap (async)
+        return new Promise((resolve) => {
+            let ticks = 0;
+            const interval = system.runInterval(() => {
+                ticks++;
+                if (!newSensor.isValid) {
+                    system.clearRun(interval);
+                    resolve(null); 
                     return;
                 }
-                const variantComponent = sensorEntity.getComponent("minecraft:variant");
-                if (variantComponent && typeof variantComponent.value === 'number') {
-                    system.clearRun(checkInterval);
 
-                    // Auto despawn jika diminta (misalnya untuk pengujian)
-                    if (autoDespawn) {
-                        system.run(() => {
-                            if (sensorEntity.isValid) {
-                                try {
-                                    sensorEntity.triggerEvent(DESPAWN_EVENT_NAME);
-                                } catch (e) {
-                                    console.error(`[ClimateSensor] Error triggering despawn for new sensor (${sensorEntity.id}): ${e.message}`);
-                                }
-                            }
-                        });
-                    }
-
-                    resolve(sensorEntity);
+                const variant = newSensor.getComponent("minecraft:variant");
+                if (variant && typeof variant.value === 'number') {
+                    system.clearRun(interval);
+                    // Langsung trigger despawn agar tidak menumpuk,
+                    // Kita hanya butuh dia eksis sebentar untuk baca value atau biarkan logic luar menghapusnya.
+                    // Tapi agar aman, biarkan logic luar (SoulSandData) yang menghapus saat block hancur.
+                    // Namun, user ingin sensor spawn jika interaksi.
+                    resolve(newSensor);
                 }
 
-                currentTicks++;
-                if (currentTicks >= timeoutTicks) {
-                    console.warn(`[ClimateSensor] Timeout menunggu komponen variant untuk sensor di ${location.x},${location.y},${location.z}.`);
-                    system.clearRun(checkInterval);
-                    // Hapus sensor jika timeout
-                    if (sensorEntity.isValid) {
-                        system.run(() => {
-                            if (sensorEntity.isValid) {
-                                try {
-                                    sensorEntity.triggerEvent(DESPAWN_EVENT_NAME);
-                                } catch (e) {
-                                    console.error(`[ClimateSensor] Error triggering despawn after timeout for sensor (${sensorEntity.id}): ${e.message}`);
-                                }
-                            }
-                        });
-                    }
+                if (ticks > 40) { // Timeout 2 detik
+                    system.clearRun(interval);
+                    try { newSensor.remove(); } catch(e){}
                     resolve(null);
                 }
-            }, 1);
+            }, 2);
         });
 
     } catch (e) {
-        console.error(`[ClimateSensor] Gagal men-spawn atau mendapatkan sensor di ${location.x},${location.y},${location.z}: ${e.message}`);
-        if (sensorEntity && sensorEntity.isValid) {
-            // Coba hapus entitas jika spawn gagal
-            system.run(() => {
-                if (sensorEntity.isValid) {
-                    try {
-                        sensorEntity.triggerEvent(DESPAWN_EVENT_NAME);
-                    } catch (e) {
-                        console.error(`[ClimateSensor] Error triggering despawn on spawn failure for sensor (${sensorEntity.id}): ${e.message}`);
-                    }
-                }
-            });
-        }
         return null;
     }
 }
 
-/**
- * Mengambil nilai iklim dari entitas sensor.
- * @param {import("@minecraft/server").Entity} sensorEntity - Entitas sensor iklim.
- * @returns {string | null} String iklim ("warm", "cold", "temperate"), atau null jika tidak dapat dibaca.
- */
 export function getClimateVariantFromSensor(sensorEntity) {
     if (sensorEntity && sensorEntity.isValid) {
         const variantComponent = sensorEntity.getComponent("minecraft:variant");
@@ -149,59 +89,30 @@ export function getClimateVariantFromSensor(sensorEntity) {
             return mapVariantToClimate(variantComponent.value);
         }
     }
-    console.warn("[ClimateSensor] Sensor tidak valid atau tidak memiliki komponen variant.");
     return null;
 }
 
-/**
- * Menghapus entitas sensor iklim. Hanya berlaku untuk Overworld.
- * @param {import("@minecraft/server").Vector3 | import("@minecraft/server").Entity} locationOrEntity - Lokasi entitas sensor atau objek entitas itu sendiri.
- * @param {import("@minecraft/server").Dimension} [dimension=null] - Dimensi tempat entitas sensor berada (hanya diperlukan jika parameter pertama adalah lokasi).
- */
 export function removeClimateSensor(locationOrEntity, dimension = null) {
-    // Sensor hanya relevan di Overworld. Di Nether/The End, tidak ada yang perlu dihapus.
-    if (dimension && dimension.id !== "minecraft:overworld") {
-        return;
-    }
-    if (locationOrEntity instanceof Entity) { 
-        const entity = locationOrEntity;
-        system.run(() => {
-            if (entity.isValid) { 
-                try {
-                    entity.triggerEvent(DESPAWN_EVENT_NAME);
-                } catch (e) {
-                    console.error(`[ClimateSensor] Error triggering despawn event for entity (${entity.id}): ${e.message}`);
-                }
-            } else {
-                console.warn(`[ClimateSensor] Entitas sensor (${entity?.id || 'unknown'}) sudah tidak valid saat mencoba menghapus langsung (dalam system.run).`);
-            }
-        });
-        return;
-    }
-
-    const location = locationOrEntity;
-    const locationString = `${location.x},${location.y},${location.z}`;
-    try {
-        const existingSensors = dimension.getEntitiesAtBlockLocation(location); // Menggunakan getEntitiesAtBlockLocation
-        const filteredSensors = existingSensors.filter(entity => entity.typeId === SENSOR_ENTITY_ID && entity.isValid);
-
-        for (const entity of filteredSensors) { 
-            system.run(() => {
-                if (entity.isValid) { 
-                    try {
-                        entity.triggerEvent(DESPAWN_EVENT_NAME);
-                    } catch (e) {
-                        console.error(`[ClimateSensor] Error triggering despawn event for sensor at ${locationString} (fallback search): ${e.message}`);
-                    }
-                } else {
-                    console.warn(`[ClimateSensor] Entitas sensor di ${locationString} (fallback search) sudah tidak valid saat mencoba menghapus (dalam system.run).`);
-                }
+    if (locationOrEntity instanceof Entity) {
+        try {
+            locationOrEntity.triggerEvent(DESPAWN_EVENT_NAME);
+            // Fallback remove jika event gagal
+            system.runTimeout(() => {
+                if(locationOrEntity.isValid) locationOrEntity.remove();
+            }, 5);
+        } catch (e) {}
+    } else if (dimension) {
+        // Remove by location
+        try {
+            const sensors = dimension.getEntities({
+                type: SENSOR_ENTITY_ID,
+                location: locationOrEntity,
+                maxDistance: 2
             });
-        }
-        if (filteredSensors.length === 0) {
-            console.warn(`[ClimateSensor] Tidak menemukan sensor valid untuk dihapus di ${locationString} (fallback search).`);
-        }
-    } catch (e) {
-        console.error(`[ClimateSensor] Error memicu despawn sensor di ${locationString} (fallback search): ${e.message}`);
+            sensors.forEach(s => {
+                try { s.triggerEvent(DESPAWN_EVENT_NAME); } catch(e){}
+                system.runTimeout(() => { if(s.isValid) s.remove(); }, 5);
+            });
+        } catch(e) {}
     }
 }

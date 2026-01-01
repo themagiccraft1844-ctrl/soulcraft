@@ -1,0 +1,19 @@
+{
+    "pools": [
+        {
+            "rolls": 1,
+            "entries": [
+                {
+                    "type": "item",
+                    "name": "soulcraft:empty_soul_sand",
+                    "weight": 33
+                },
+                {
+                    "type": "item",
+                    "name": "minecraft:soul_soil",
+                    "weight": 67
+                }
+            ]
+        }
+    ]
+}

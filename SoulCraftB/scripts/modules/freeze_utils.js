@@ -1,143 +1,162 @@
 // BP/scripts/modules/freeze_utils.js
 
 import { world, system, BlockPermutation } from '@minecraft/server';
-import { getUniqueKeyFromLocation, isBlockAnchored } from './location_utils';
-import { freezeQueues, meltQueues, startQueueProcessor, cancelJobsAtLocation } from './queue_processors';
+import { getUniqueKeyFromLocation, isBlockAnchored, distanceSquared } from './location_utils';
+import { isFreezeableWaterSource } from './water_utils';
+import { registerRandomTickJob, unregisterRandomTickJob } from './queue_processors.js';
+import { isCandidateBlocked } from './blocked_candidate_block.js'; // IMPORT BARU
 
 const MAX_FREEZE_RADIUS = 5;
-const MAX_SCAN_BLOCKS = 500;
+
+// Konfigurasi kecepatan (Peluang terjadi per random tick check)
+const FREEZE_CHANCE = {
+    warm: 0.02,      // Sangat lambat/hampir tidak mungkin terjadi di biome panas
+    temperate: 0.10, // Kecepatan sedang untuk biome normal
+    cold: 0.35       // Cepat tapi tidak instan untuk biome dingin
+};
+
+// Konfigurasi kecepatan Pencairan (UPDATED: INSTAN/AGRESIF)
+const MELT_CHANCE = {
+    warm: 0.85,      // Sangat Instan di tempat panas (85% peluang per tick)
+    temperate: 0.60, // Cepat di tempat biasa
+    cold: 0.0        // [PENTING] 0% Mencair di biome dingin. Es akan abadi.
+};
 
 export class FreezingManager {
     constructor(anchorLocation, dimension, activeMakers) {
         this.anchorLocation = anchorLocation;
         this.dimension = dimension;
         this.activeMakers = activeMakers;
-        this.createdIce = new Map();
+        
+        this.currentTarget = null; 
+        this.isFreezing = false;
+        this.activeClimate = "temperate";
     }
 
-    trackCreatedIce(location, wasSource) {
-        const key = getUniqueKeyFromLocation(location);
-        this.createdIce.set(key, { location, wasSource });
+    triggerSmartFreezeScan(climateVariant) {
+        this.activeClimate = climateVariant;
+        this.isFreezing = true; 
+        this._findNextTarget();
     }
 
-    /**
-     * FUNGSI BARU: Memindai dan memulihkan data es di sekitar anchor setelah reload.
-     */
-    repopulateIceDataOnReload() {
-        console.log(`[FreezeUtils] Memulihkan data es untuk anchor di ${getUniqueKeyFromLocation(this.anchorLocation)}`);
-        for (let x = -MAX_FREEZE_RADIUS; x <= MAX_FREEZE_RADIUS; x++) {
-            for (let y = -MAX_FREEZE_RADIUS; y <= MAX_FREEZE_RADIUS; y++) {
-                for (let z = -MAX_FREEZE_RADIUS; z <= MAX_FREEZE_RADIUS; z++) {
-                    const checkLoc = { 
-                        x: this.anchorLocation.x + x, 
-                        y: this.anchorLocation.y + y, 
-                        z: this.anchorLocation.z + z 
-                    };
-                    try {
-                        const block = this.dimension.getBlock(checkLoc);
-                        if (block && block.isValid && block.typeId === 'minecraft:ice') {
-                            // Klaim es ini sebagai milik kita. Asumsikan 'wasSource' true sebagai default yang aman.
-                            this.trackCreatedIce(block.location, true);
-                        }
-                    } catch(e) { /* Abaikan chunk tidak dimuat */ }
+    triggerMeltProcess(climateVariant) {
+        this.activeClimate = climateVariant;
+        this.isFreezing = false; 
+        this._findNextTarget();
+    }
+
+    _findNextTarget() {
+        unregisterRandomTickJob(getUniqueKeyFromLocation(this.anchorLocation));
+        this.currentTarget = null;
+
+        const maxRange = MAX_FREEZE_RADIUS;
+        
+        const startR = this.isFreezing ? 1 : maxRange;
+        const endR = this.isFreezing ? maxRange : 1;
+        const step = this.isFreezing ? 1 : -1;
+        
+        for (let r = startR; (this.isFreezing ? r <= endR : r >= endR); r += step) {
+            let candidates = [];
+
+            for (let x = -r; x <= r; x++) {
+                for (let y = -r; y <= r; y++) {
+                    for (let z = -r; z <= r; z++) {
+                        if (Math.abs(x) !== r && Math.abs(y) !== r && Math.abs(z) !== r) continue;
+
+                        const targetLoc = {
+                            x: this.anchorLocation.x + x,
+                            y: this.anchorLocation.y + y,
+                            z: this.anchorLocation.z + z
+                        };
+
+                        try {
+                            const block = this.dimension.getBlock(targetLoc);
+                            if (!block || !block.isValid) continue;
+
+                            if (this.isFreezing) {
+                                // LOGIKA PEMBEKUAN
+                                if (isFreezeableWaterSource(block, this.dimension)) {
+                                    // [FITUR BARU] Cek apakah jalur suhu dingin terblokir?
+                                    // Jika terblokir, jangan masukkan ke kandidat (skip).
+                                    if (!isCandidateBlocked(block, this.anchorLocation, this.dimension)) {
+                                        candidates.push(block);
+                                    }
+                                }
+                            } else {
+                                // LOGIKA PENCAIRAN
+                                if (block.typeId === "minecraft:ice") {
+                                    if (!isBlockAnchored(targetLoc, this.dimension, this.activeMakers, this.anchorLocation)) {
+                                        // Untuk pencairan, kita asumsikan panas lingkungan yang bekerja, 
+                                        // jadi tidak perlu cek blocked line of sight dari ESS (karena ESS-nya sudah hancur/hilang).
+                                        candidates.push(block);
+                                    }
+                                }
+                            }
+                        } catch (e) { /* Chunk unloaded */ }
+                    }
                 }
             }
-        }
-    }
 
-    triggerSmartFreezeScan(climateVariant, anchorData) {
-        cancelJobsAtLocation(this.anchorLocation);
-
-        if (!freezeQueues[climateVariant]) {
-            console.warn(`[FreezeUtils] Varian iklim tidak valid: ${climateVariant}`);
-            return;
-        }
-
-        const blocksToFreeze = [];
-        const queue = [{ location: this.anchorLocation, distance: 0 }];
-        const visited = new Set([getUniqueKeyFromLocation(this.anchorLocation)]);
-        const icePermutation = BlockPermutation.resolve("minecraft:ice");
-
-        const offsets = [
-            { x: 1, y: 0, z: 0 }, { x: -1, y: 0, z: 0 },
-            { x: 0, y: 1, z: 0 }, { x: 0, y: -1, z: 0 },
-            { x: 0, y: 0, z: 1 }, { x: 0, y: 0, z: -1 }
-        ];
-
-        let scannedCount = 0;
-        while (queue.length > 0 && scannedCount < MAX_SCAN_BLOCKS) {
-            const { location, distance } = queue.shift();
-            if (distance >= MAX_FREEZE_RADIUS) continue;
-
-            for (const offset of offsets) {
-                const nextLoc = { 
-                    x: location.x + offset.x, 
-                    y: location.y + offset.y, 
-                    z: location.z + offset.z 
+            if (candidates.length > 0) {
+                const luckyOne = candidates[Math.floor(Math.random() * candidates.length)];
+                
+                this.currentTarget = {
+                    location: luckyOne.location,
+                    expectedType: this.isFreezing ? ["minecraft:water", "minecraft:flowing_water"] : ["minecraft:ice"]
                 };
-                const key = getUniqueKeyFromLocation(nextLoc);
-                if (visited.has(key)) continue;
-                visited.add(key);
-                scannedCount++;
 
-                try {
-                    const block = this.dimension.getBlock(nextLoc);
-                    if (!block || !block.isValid) continue;
-                    const typeId = block.typeId;
-
-                    if (typeId === "minecraft:water" || typeId === "minecraft:flowing_water") {
-                        blocksToFreeze.push({ block, permutation: icePermutation, anchorData });
-                        queue.push({ location: nextLoc, distance: distance + 1 });
-                    } else if (block.isAir) {
-                        queue.push({ location: nextLoc, distance: distance + 1 });
-                    }
-                } catch (e) { /* Abaikan */ }
+                registerRandomTickJob(getUniqueKeyFromLocation(this.anchorLocation), this);
+                return; 
             }
-        }
-
-        if (blocksToFreeze.length > 0) {
-            blocksToFreeze.sort((a, b) => {
-                const distA = Math.abs(a.block.location.x - this.anchorLocation.x) + Math.abs(a.block.location.y - this.anchorLocation.y) + Math.abs(a.block.location.z - this.anchorLocation.z);
-                const distB = Math.abs(b.block.location.x - this.anchorLocation.x) + Math.abs(b.block.location.y - this.anchorLocation.y) + Math.abs(b.block.location.z - this.anchorLocation.z);
-                return distA - distB;
-            });
-
-            freezeQueues[climateVariant].push(...blocksToFreeze);
-            startQueueProcessor();
         }
     }
 
-    triggerMeltProcess(climateVariant, anchorData) {
-        cancelJobsAtLocation(this.anchorLocation);
+    executeRandomTick() {
+        if (!this.currentTarget) return false;
 
-        if (!meltQueues[climateVariant]) {
-            console.warn(`[FreezeUtils] Varian iklim tidak valid untuk pencairan: ${climateVariant}`);
-            return;
+        const chance = this.isFreezing ? FREEZE_CHANCE[this.activeClimate] : MELT_CHANCE[this.activeClimate];
+        
+        if (chance <= 0) {
+            unregisterRandomTickJob(getUniqueKeyFromLocation(this.anchorLocation));
+            return false;
         }
         
-        const waterPermutation = BlockPermutation.resolve("minecraft:water");
-        const flowingWaterPermutation = BlockPermutation.resolve("minecraft:flowing_water");
-        const jobs = [];
+        if (Math.random() > chance) {
+            return false; 
+        }
 
-        for (const [key, iceData] of this.createdIce.entries()) {
-            try {
-                if (!isBlockAnchored(iceData.location, this.dimension, this.activeMakers, this.anchorLocation)) {
-                    const block = this.dimension.getBlock(iceData.location);
-                    if (block && block.isValid && block.typeId === 'minecraft:ice') {
-                        jobs.push({
-                            block,
-                            permutation: iceData.wasSource ? waterPermutation : flowingWaterPermutation,
-                            anchorData
-                        });
+        try {
+            const block = this.dimension.getBlock(this.currentTarget.location);
+            if (!block || !block.isValid) {
+                this._findNextTarget();
+                return false;
+            }
+
+            if (this.isFreezing) {
+                if (isFreezeableWaterSource(block, this.dimension)) {
+                    // Cek validasi terakhir sebelum eksekusi (opsional tapi aman)
+                    if (!isCandidateBlocked(block, this.anchorLocation, this.dimension)) {
+                        block.setPermutation(BlockPermutation.resolve("minecraft:ice"));
+                        this._findNextTarget();
+                        return true;
+                    } else {
+                        // Jika tiba-tiba terblokir (player taruh blok pas scanning), cari target lain
+                        this._findNextTarget();
+                        return false;
                     }
                 }
-            } catch(e) { /* Abaikan */ }
-        }
-        
-        this.createdIce.clear();
-        if (jobs.length > 0) {
-            meltQueues[climateVariant].push(...jobs);
-            startQueueProcessor();
-        }
+            } else {
+                if (block.typeId === "minecraft:ice") {
+                    if (!isBlockAnchored(block.location, this.dimension, this.activeMakers, this.anchorLocation)) {
+                        block.setPermutation(BlockPermutation.resolve("minecraft:flowing_water"));
+                        this._findNextTarget();
+                        return true;
+                    }
+                }
+            }
+        } catch (e) { }
+
+        this._findNextTarget();
+        return false;
     }
 }
