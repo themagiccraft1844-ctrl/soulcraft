@@ -1,0 +1,87 @@
+{
+	"format_version": "1.21.50",
+	"minecraft:block": {
+		"description": {
+			"identifier": "soulcraft:end_portal_frame",
+			"menu_category": {
+				"category": "nature",
+				"group": "itemGroup.name.end_portal_frame"
+			},
+			"states": {
+				"soulcraft:eye_bit": [false, true],
+				"soulcraft:cardinal_direction": ["north", "south", "east", "west"]
+			}
+		},
+		"components": {
+			"minecraft:destructible_by_mining": {
+				"seconds_to_destroy": 4.0
+			},
+			"minecraft:destructible_by_explosion": {
+				"explosion_resistance": 9.0
+			},
+			"minecraft:friction": 0.4,
+			"minecraft:map_color": "#383d36",
+			"minecraft:light_emission": 3,
+			"minecraft:geometry": "geometry.end_portal_frame.empty",
+			"minecraft:selection_box": {
+				"origin": [-8, 0, -8],
+				"size": [16, 13, 16]
+			},
+			"minecraft:collision_box": {
+				"origin": [-8, 0, -8],
+				"size": [16, 13, 16]
+			},
+			"minecraft:material_instances": {
+				"*": {
+					"texture": "endframe_side",
+					"render_method": "opaque"
+				},
+				"up": {
+					"texture": "endframe_top",
+					"render_method": "opaque"
+				},
+				"down": {
+					"texture": "endframe_bottom",
+					"render_method": "opaque"
+				},
+				"eye": {
+					"texture": "endframe_eye",
+					"render_method": "opaque"
+				}
+			}
+		},
+		"permutations": [
+			{
+				"condition": "q.block_state('soulcraft:eye_bit')",
+				"components": {
+					"minecraft:geometry": "geometry.end_portal_frame",
+					"minecraft:light_emission": 1
+				}
+			},
+			{
+				"condition": "q.block_state('soulcraft:cardinal_direction') == 'north'",
+				"components": {
+					"minecraft:transformation": { "rotation": [0, 180, 0] }
+				}
+			},
+			{
+				"condition": "q.block_state('soulcraft:cardinal_direction') == 'south'",
+				"components": {
+					"minecraft:transformation": { "rotation": [0, 0, 0] }
+				}
+			},
+			{
+				"condition": "q.block_state('soulcraft:cardinal_direction') == 'west'",
+				"components": {
+					"minecraft:transformation": { "rotation": [0, -90, 0] }
+				}
+			},
+			{
+				"condition": "q.block_state('soulcraft:cardinal_direction') == 'east'",
+				"components": {
+					"minecraft:transformation": { "rotation": [0, 90, 0] }
+				}
+			}
+		]
+	}
+}
